@@ -1,0 +1,6 @@
+realesrgan==0.3.0
+Pillow>=10.0.0
+basicsr==1.4.2
+# Nota: instalar torch/torchvision CPU ANTES de realesrgan/basicsr:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#   pip install -r requirements.txt --no-build-isolation

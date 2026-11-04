@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Modelos y datos de foto (NUNCA versionar)
+*.pth
+*.safetensors
+*.onnx
+*.ckpt
+photos_dataset/
+photos/
+*.tmp/
+
+# Sensitive
+.env
+*.token
+imprimir_bot_*.log

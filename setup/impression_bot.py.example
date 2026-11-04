@@ -1,0 +1,848 @@
+#!/usr/bin/env python3
+"""
+Impression Bot - Bot de Telegram dedicado al grupo "Impresión"
+Funcionalidades:
+- Recibir fotos y documentos
+- Aplicar mejora local de imagen antes de imprimir
+- Enviar a la impresora Canon PIXMA G3110
+- Registrar impresiones en logger
+"""
+
+import os
+import sys
+import json
+import logging
+import asyncio
+import tempfile
+import subprocess
+from pathlib import Path
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+
+# Importar logger de impresión y mejora de fotos
+sys.path.insert(0, '/path/to/your/media/scripts')
+from rio_print_logger import log_print
+from photo_enhance import EnhanceConfig, enhance_photo_from_config
+
+# F1: inspector + carriles + estampa de fecha (print-bot-enhance)
+sys.path.insert(0, '/root/my_print_bot/enhance_f1')
+import pipeline as photo_pipeline
+import watermark as wm
+
+# Fecha pendiente por usuario: {user_id: (future, deadline)}. 5 min para responder.
+PENDING_DATE: dict = {}
+
+# Configuración
+BOT_TOKEN = os.getenv("IMPRESSION_BOT_TOKEN", "TU_TOKEN_AQUI")
+LOG_FILE = "/var/log/impression_bot.log"
+STATUS_FILE = "/tmp/impression_bot_status.txt"
+BOT_CONFIG_PATH = "/root/.bot_data/memory/impression-bot-config.json"
+
+# Seguridad — solo Christian puede imprimir
+ALLOWED_USER_IDS = [123456789]  # Tu Telegram user ID (numeric, obtenlo desde @userinfobot)
+
+# Configuración de impresión - Canon PIXMA G3110 via LPD al router
+CANON_PRINTER = "Fotos"
+
+# Setup logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+
+def load_bot_config() -> dict:
+    """Cargar configuración completa del bot."""
+    path = Path(BOT_CONFIG_PATH)
+    if path.exists():
+        try:
+            with open(path, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Error cargando config: {e}")
+    return {
+        "default": {
+            "size": "5x7",
+            "crop_strategy": "center",
+            "filter_profile": "auto",
+            "ppi": 600,
+            "enhance_enabled": True
+        },
+        "users": {}
+    }
+
+
+def save_bot_config(data: dict) -> None:
+    """Guardar configuración completa del bot."""
+    path = Path(BOT_CONFIG_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def get_user_config(user_id: int) -> EnhanceConfig:
+    """Cargar configuración de mejora para un usuario."""
+    data = load_bot_config()
+    defaults = data.get("default", {})
+    users = data.get("users", {})
+    user_cfg = users.get(str(user_id), {})
+    merged = {**defaults, **user_cfg}
+    return EnhanceConfig(**merged)
+
+
+def set_user_config(user_id: int, config: EnhanceConfig) -> None:
+    """Guardar configuración de mejora para un usuario."""
+    data = load_bot_config()
+    data.setdefault("users", {})
+    data["users"][str(user_id)] = {
+        "size": config.size,
+        "crop_strategy": config.crop_strategy,
+        "filter_profile": config.filter_profile,
+        "ppi": config.ppi,
+        "enhance_enabled": config.enhance_enabled,
+    }
+    save_bot_config(data)
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handler for /start command"""
+    user = update.effective_user
+    await update.message.reply_html(
+        rf"¡Hola {user.mention_html()}! 📸🖨️\n\n"
+        "Soy el bot de impresión. Envíame una foto y yo la imprimo automáticamente en la Canon PIXMA G3110.\n\n"
+        "Formato: 13x18 cm (5x7 pulgadas)\n"
+        "Calidad: Fotográfica 600ppi\n"
+        "🎨 Mejora automática: activada por defecto\n\n"
+        "<b>Comandos:</b>\n"
+        "/help - Ayuda\n"
+        "/status - Estado del sistema\n"
+        "/size - Cambiar tamaño de papel (5x7 / 4x6)\n"
+        "/enhance - Activar/desactivar mejora automática\n"
+        "/crop - Recorte opcional al papel (none/center/entropy/face)\n"
+        "/filter - Perfil de ajuste (auto/vivid/soft/none)\n"
+        "/ping - Test de conectividad\n"
+        "/pause - Pausar cola\n"
+        "/resume - Reanudar trabajos pausados"
+    )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handler for /help command"""
+    help_text = """📋 <b>Comandos disponibles:</b>
+
+/start - Iniciar el bot
+/help - Mostrar esta ayuda
+/size - Cambiar tamaño de papel (5x7 / 4x6)
+/enhance - Activar/desactivar mejora automática
+/crop - Recorte opcional al papel (none/center/entropy/face)
+/filter - Perfil de ajuste (auto/vivid/soft/none)
+/status - Estado del sistema
+/queue - Ver cola de impresión
+/ping - Test de conectividad
+/pause - Pausar cola de impresión
+/resume - Reanudar trabajos pausados
+
+<b>Para imprimir:</b>
+Envíame una foto (como imagen, no como archivo). La mejoraré automáticamente y la enviaré a la Canon PIXMA G3110 en formato 13x18 cm, calidad fotográfica.
+"""
+    await update.message.reply_text(help_text, parse_mode='HTML')
+
+
+async def set_paper_size(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handler for /size - Change paper size (5x7 or 4x6)"""
+    user = update.effective_user
+    if user.id not in ALLOWED_USER_IDS:
+        await update.message.reply_text("❌ No autorizado.")
+        return
+
+    config = get_user_config(user.id)
+
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            f"📐 Tamaño actual: {config.size} "
+            f"({'13x18 cm' if config.size == '5x7' else '10x15 cm'})\n\n"
+            "Para cambiarlo:\n"
+            "/size 5x7  - 13x18 cm\n"
+            "/size 4x6  - 10x15 cm"
+        )
+        return
+
+    new_size = args[0].lower()
+    if new_size not in ('4x6', '5x7'):
+        await update.message.reply_text("❌ Tamaño no válido. Usa: /size 5x7 o /size 4x6")
+        return
+
+    config.size = new_size
+    set_user_config(user.id, config)
+
+    label = "13x18 cm" if new_size == "5x7" else "10x15 cm"
+    await update.message.reply_text(
+        f"✅ Tamaño cambiado a {label} ({new_size})\n\n"
+        "La próxima foto se imprimirá en ese formato."
+    )
+    logger.info(f"Paper size changed to {new_size} ({label}) by {user.first_name}")
+
+
+async def toggle_enhance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handler for /enhance - Activar/desactivar mejora automática."""
+    user = update.effective_user
+    if user.id not in ALLOWED_USER_IDS:
+        await update.message.reply_text("❌ No autorizado.")
+        return
+
+    config = get_user_config(user.id)
+    args = context.args
+
+    if not args:
+        status = "✅ Activada" if config.enhance_enabled else "⏸️ Desactivada"
+        await update.message.reply_text(
+            f"🎨 Mejora automática: {status}\n\n"
+            f"📐 Tamaño: {config.size}\n"
+            f"✂️ Recorte: {config.crop_strategy}\n"
+            f"🌈 Filtro: {config.filter_profile}\n"
+            f"🖨️ PPI: {config.ppi}\n\n"
+            "Para cambiar:\n"
+            "/enhance on\n"
+            "/enhance off"
+        )
+        return
+
+    arg = args[0].lower()
+    if arg in ("on", "1", "true", "si", "sí"):
+        config.enhance_enabled = True
+        set_user_config(user.id, config)
+        await update.message.reply_text(
+            "✅ Mejora automática ACTIVADA.\n\n"
+            "Las próximas fotos se ajustarán automáticamente antes de imprimir."
+        )
+    elif arg in ("off", "0", "false", "no"):
+        config.enhance_enabled = False
+        set_user_config(user.id, config)
+        await update.message.reply_text(
+            "⏸️ Mejora automática DESACTIVADA.\n\n"
+            "Las fotos se imprimirán tal cual las envíes."
+        )
+    else:
+        await update.message.reply_text("❌ Opción no válida. Usa: /enhance on o /enhance off")
+
+
+async def set_crop_strategy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handler for /crop - Elegir estrategia de recorte."""
+    user = update.effective_user
+    if user.id not in ALLOWED_USER_IDS:
+        await update.message.reply_text("❌ No autorizado.")
+        return
+
+    config = get_user_config(user.id)
+    args = context.args
+    valid = ["none", "center", "entropy", "face"]
+
+    if not args:
+        await update.message.reply_text(
+            f"✂️ Estrategia de recorte actual: {config.crop_strategy}\n\n"
+            "Por defecto no se recorta, manteniendo la foto completa.\n\n"
+            "Opciones:\n"
+            "/crop none    - Sin recorte (default)\n"
+            "/crop center  - Recorte centrado al tamaño de papel\n"
+            "/crop entropy - Zona más interesante (deshabilitado)\n"
+            "/crop face    - Centrado en caras (deshabilitado)"
+        )
+        return
+
+    strategy = args[0].lower()
+    if strategy not in valid:
+        await update.message.reply_text("❌ Estrategia no válida. Opciones: none, center, entropy, face")
+        return
+
+    if strategy in ("entropy", "face"):
+        await update.message.reply_text(
+            f"⚠️ '{strategy}' aún no está disponible en este entorno.\n"
+            "Se usará recorte centrado como fallback."
+        )
+
+    config.crop_strategy = strategy
+    set_user_config(user.id, config)
+    await update.message.reply_text(
+        f"✅ Estrategia de recorte cambiada a: {strategy}\n\n"
+        "Aplicará en la próxima foto."
+    )
+
+
+async def set_filter_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handler for /filter - Elegir perfil de ajuste de color."""
+    user = update.effective_user
+    if user.id not in ALLOWED_USER_IDS:
+        await update.message.reply_text("❌ No autorizado.")
+        return
+
+    config = get_user_config(user.id)
+    args = context.args
+    valid = ["auto", "vivid", "soft", "none"]
+
+    if not args:
+        await update.message.reply_text(
+            f"🌈 Perfil de ajuste actual: {config.filter_profile}\n\n"
+            "Opciones:\n"
+            "/filter auto  - Auto-level + nitidez sutil\n"
+            "/filter vivid - Más color y contraste\n"
+            "/filter soft  - Más suave\n"
+            "/filter none  - Sin ajustes de color"
+        )
+        return
+
+    profile = args[0].lower()
+    if profile not in valid:
+        await update.message.reply_text("❌ Perfil no válido. Opciones: auto, vivid, soft, none")
+        return
+
+    config.filter_profile = profile
+    set_user_config(user.id, config)
+    await update.message.reply_text(
+        f"✅ Perfil de ajuste cambiado a: {profile}\n\n"
+        "Aplicará en la próxima foto."
+    )
+
+
+async def pause_queue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handler for /pause - Pauses all pending jobs, lets current one finish"""
+    user = update.effective_user
+    if user.id not in ALLOWED_USER_IDS:
+        await update.message.reply_text("❌ No autorizado.")
+        return
+    try:
+        # Get all active jobs
+        result = subprocess.run(
+            ['/usr/bin/lpstat', '-o'],
+            capture_output=True, text=True, timeout=10
+        )
+
+        if result.returncode != 0 or not result.stdout.strip():
+            await update.message.reply_text("📭 No hay trabajos en cola para pausar.")
+            return
+
+        lines = result.stdout.strip().split('\n')
+        held = 0
+        current_job = None
+
+        for line in lines:
+            if not line.strip():
+                continue
+            # Parse job ID (format: "Fotos-123    user    ...")
+            parts = line.split()
+            if not parts:
+                continue
+            job_id = parts[0]
+
+            # Skip if this job is currently printing (has completion %)
+            if '%' in line:
+                current_job = job_id
+                continue
+
+            # Hold the job
+            hold = subprocess.run(
+                ['/usr/bin/lp', '-i', job_id, '-H', 'hold'],
+                capture_output=True, text=True, timeout=10
+            )
+
+            if hold.returncode == 0:
+                held += 1
+
+        msg = f"⏸️ Cola de impresión pausada\n\n"
+        if current_job:
+            msg += f"🔄 {current_job} en curso — se deja terminar\n"
+        if held > 0:
+            msg += f"⏳ {held} trabajo(s) puestos en espera\n"
+
+        await update.message.reply_text(msg)
+
+    except Exception as e:
+        logger.error(f"Error in /pause: {e}")
+        await update.message.reply_text(f"❌ Error al pausar: {str(e)}")
+
+
+async def resume_queue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handler for /resume - Releases all held jobs"""
+    try:
+        # Get held jobs
+        result = subprocess.run(
+            ['/usr/bin/lpstat', '-W', 'held'],
+            capture_output=True, text=True, timeout=10
+        )
+
+        if result.returncode != 0 or not result.stdout.strip():
+            await update.message.reply_text("📭 No hay trabajos pausados para reanudar.")
+            return
+
+        lines = result.stdout.strip().split('\n')
+        released = 0
+
+        for line in lines:
+            if not line.strip():
+                continue
+            parts = line.split()
+            if not parts:
+                continue
+            job_id = parts[0]
+
+            hold = subprocess.run(
+                ['/usr/bin/lp', '-i', job_id, '-H', 'resume'],
+                capture_output=True, text=True, timeout=10
+            )
+
+            if hold.returncode == 0:
+                released += 1
+
+        if released > 0:
+            await update.message.reply_text(
+                f"▶️ {released} trabajo(s) reanudados. La cola continúa."
+            )
+        else:
+            await update.message.reply_text("⚠️ No se pudo reanudar ningún trabajo.")
+
+    except Exception as e:
+        logger.error(f"Error in /resume: {e}")
+        await update.message.reply_text(f"❌ Error al reanudar: {str(e)}")
+
+
+async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handler for /queue - Muestra trabajos en cola de impresión"""
+    try:
+        msg = ""
+
+        # Jobs activos (not-completed)
+        result = subprocess.run(
+            ['/usr/bin/lpstat', '-W', 'not-completed', '-o'],
+            capture_output=True, text=True, timeout=10
+        )
+        active = result.stdout.strip() if result.returncode == 0 else ""
+
+        # Jobs completados recientes
+        completed = subprocess.run(
+            ['/usr/bin/lpstat', '-W', 'completed', '-o'],
+            capture_output=True, text=True, timeout=10
+        )
+        done = completed.stdout.strip() if completed.returncode == 0 else ""
+
+        # Jobs held/pausados
+        held = subprocess.run(
+            ['/usr/bin/lpstat', '-W', 'held'],
+            capture_output=True, text=True, timeout=10
+        )
+        held_jobs = held.stdout.strip() if held.returncode == 0 else ""
+
+        if active:
+            count = len([l for l in active.split('\n') if l.strip()])
+            msg += f"⏳ <b>En cola ({count}):</b>\n<pre>{active}</pre>\n"
+        else:
+            msg += "✅ <b>En cola:</b> Vacía\n"
+
+        if held_jobs:
+            msg += f"⏸️ <b>Pausados:</b>\n<pre>{held_jobs}</pre>\n"
+
+        if done:
+            lines = [l for l in done.split('\n') if l.strip()]
+            recent = '\n'.join(lines[:5])  # Solo últimos 5
+            msg += f"✅ <b>Últimos completados ({min(len(lines), 5)} de {len(lines)}):</b>\n<pre>{recent}</pre>\n"
+
+        if not active and not held_jobs and not done:
+            msg = "📭 La cola de impresión está completamente vacía."
+
+        await update.message.reply_text(msg, parse_mode='HTML')
+
+    except Exception as e:
+        logger.error(f"Error in /queue: {e}")
+        await update.message.reply_text(f"❌ Error al consultar la cola: {str(e)}")
+
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handler for /status command"""
+    try:
+        import subprocess
+
+        # Uptime
+        uptime = subprocess.check_output("uptime -p", shell=True, text=True).strip()
+
+        # Uso de disco
+        disk_usage = subprocess.check_output("df -h / | awk 'NR==2 {print $5}'", shell=True, text=True).strip()
+
+        # Memoria
+        mem_info = subprocess.check_output("free -h | awk 'NR==2 {printf \"%s/%s\", $3,$2}'", shell=True, text=True).strip()
+
+        # Estado de impresoras CUPS
+        try:
+            lpstat_result = subprocess.run(["/usr/bin/lpstat", "-p"], capture_output=True, text=True, timeout=5)
+            printers = lpstat_result.stdout.strip() if lpstat_result.returncode == 0 else "No se pudo obtener estado"
+        except:
+            printers = "CUPS no disponible"
+
+        status_text = f"""🖨️ <b>Estado del Sistema - Impresión Bot</b>
+
+⏱️ Uptime: {uptime}
+💾 Disk: {disk_usage} used
+🧠 Memory: {mem_info}
+
+🖨️ <b>Impresoras CUPS:</b>
+<pre>{printers}</pre>
+
+📝 Logs: {LOG_FILE}
+"""
+        await update.message.reply_text(status_text, parse_mode='HTML')
+
+    except Exception as e:
+        logger.error(f"Error in /status: {e}")
+        await update.message.reply_text("❌ Error obteniendo estado del sistema")
+
+
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handler for /ping command — verifica conectividad + estado impresoras"""
+    msg = "🏓 Pong! El bot de impresión está activo.\n\n"
+
+    # Verificar estado de impresoras
+    for printer in ("Fotos", "Docs"):
+        try:
+            result = subprocess.run(
+                ["/usr/bin/lpstat", "-p", printer],
+                capture_output=True, text=True, timeout=5
+            )
+            status = result.stdout.strip() if result.returncode == 0 else "No disponible"
+
+            if "inactiva" in status.lower() or "disabled" in status.lower() or "down" in status.lower():
+                msg += f"⚠️ <b>{printer}</b> — inactiva\n"
+            elif "activa" in status.lower() or "idle" in status.lower():
+                msg += f"✅ <b>{printer}</b> — activa\n"
+            else:
+                msg += f"❓ <b>{printer}</b> — {status}\n"
+        except Exception as e:
+            msg += f"❌ <b>{printer}</b> — error al consultar: {e}\n"
+
+    await update.message.reply_text(msg, parse_mode="HTML")
+
+
+async def print_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handler for photo messages - downloads, enhances and prints the photo"""
+    user = update.effective_user
+    message = update.message
+
+    # Whitelist check — solo Christian
+    if user.id not in ALLOWED_USER_IDS:
+        logger.warning(f"Print attempt blocked for unauthorized user: {user.id} (@{user.username})")
+        await message.reply_text("❌ No autorizado. Este bot es de uso privado.")
+        return
+
+    logger.info(f"Photo received from {user.first_name} (@{user.username})")
+
+    # Cargar configuración de mejora del usuario
+    config = get_user_config(user.id)
+    photo_size = config.size
+
+    # Get the largest photo available
+    photo = message.photo[-1]  # Last one is the largest
+    file_id = photo.file_id
+
+    # Download the photo
+    progress_msg = await message.reply_text("📸 Descargando foto...")
+
+    tmp_path = None
+    enhanced_path = None
+
+    try:
+        # Get file from Telegram
+        new_file = await context.bot.get_file(file_id)
+
+        # Create temp file
+        with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp_file:
+            tmp_path = tmp_file.name
+
+        # Download to temp file
+        await new_file.download_to_drive(tmp_path)
+        logger.info(f"Photo downloaded to {tmp_path}")
+
+        # F1: inspector → carriles → estampa de fecha
+        if config.enhance_enabled:
+            enhanced_info = ""
+            await progress_msg.edit_text("🔍 Inspeccionando la foto...")
+            exif_date = None
+            date_fut = None
+            deadline = 0.0
+            try:
+                exif_date = wm.has_exif_date(tmp_path)
+                if not exif_date:
+                    # Sin fecha: preguntar; el pipeline sigue en paralelo (5 min máx)
+                    await context.bot.send_message(
+                        chat_id=user.id,
+                        text="📅 ¿Esta foto tiene fecha? Envíame DD-MM-AAAA (ej: 25-10-1998) "
+                             "o /sinfecha. Si no respondes en 5 minutos, se estampa sin fecha.",
+                    )
+                    loop = asyncio.get_running_loop()
+                    date_fut = loop.create_future()
+                    deadline = loop.time() + 300
+                    PENDING_DATE[user.id] = (date_fut, deadline)
+            except Exception as e:
+                logger.warning(f"verificación de fecha falló: {e}")
+
+            try:
+                await progress_msg.edit_text("🎨 Mejorando foto antes de imprimir...")
+                meta = await asyncio.to_thread(photo_pipeline.run, tmp_path, None)
+                logger.info(f"Pipeline F1: {meta}")
+                final_path = meta["final_path"]
+                if meta.get("inspector"):
+                    enhanced_info += f"🔍 Inspector: {meta.get('inspector')}\n"
+
+                # Esperar la respuesta de la fecha (el reloj corre desde la foto)
+                date = exif_date
+                if date_fut is not None:
+                    loop = asyncio.get_running_loop()
+                    wait = max(0.1, deadline - loop.time())
+                    try:
+                        date = await asyncio.wait_for(date_fut, timeout=wait)
+                    except asyncio.TimeoutError:
+                        date = None
+                    finally:
+                        PENDING_DATE.pop(user.id, None)
+
+                if date:
+                    stamped = wm.stamp(final_path, date, f"{tmp_path}_dated.jpg")
+                    # dataset final reemplazado por la versión con fecha
+                    import shutil
+                    shutil.copy(stamped, meta["dataset_final"])
+                    import json as _json
+                    sidecar = Path(meta["dataset_final"]).parent / "sidecar.json"
+                    sc = _json.loads(sidecar.read_text())
+                    sc["fecha"] = date
+                    sc["stamped_path"] = stamped
+                    sidecar.write_text(_json.dumps(sc, indent=2, ensure_ascii=False, default=str))
+                    final_path = stamped
+                    enhanced_info += f"\n📅 Fecha estampada: {date}"
+                    print_path = final_path
+                else:
+                    print_path = final_path
+
+                if meta["carriles"]:
+                    activos = [k for k, v in meta["carriles"].items() if v is True]
+                    if activos:
+                        enhanced_info += f"\n🛠️ Carriles: {', '.join(activos)}"
+            except Exception as e:
+                logger.error(f"Pipeline F1 failed, printing original: {e}")
+                await progress_msg.edit_text(
+                    f"⚠️ No se pudo mejorar la foto ({str(e)}).\n"
+                    "Se imprimirá la original."
+                )
+                print_path = tmp_path
+                # Breve espera para que el usuario lea el mensaje
+                await asyncio.sleep(1.5)
+        else:
+            print_path = tmp_path
+            enhanced_info = ""
+
+        # Print the photo
+        await progress_msg.edit_text("🖨️ Enviando a la impresora Canon...")
+
+        # Execute lp command for Canon PIXMA G3110
+        result = subprocess.run([
+            '/usr/bin/lp', '-d', CANON_PRINTER,
+            '-o', f'media={photo_size}',
+            '-o', 'scaling=fitplot',
+            '-o', 'ppi=600',
+            '-o', 'MediaType=photopaper',
+            '-o', 'ColorModel=rgb',
+            '-o', 'print-quality=high',
+            '-o', 'CNGrayscale=False',
+            print_path
+        ], capture_output=True, text=True, timeout=60)
+
+        if result.returncode == 0:
+            # Extract job ID from lp output (e.g., "request id is Fotos-123")
+            job_id = result.stdout.strip() or "desconocido"
+            logger.info(f"Print job submitted: {job_id}")
+
+            # Registrar en el log de impresiones
+            log_print(
+                user=user.username or str(user.id),
+                file=tmp_path.split('/')[-1] if tmp_path else "foto.jpg",
+                printer=CANON_PRINTER,
+                result="success",
+                job_id=job_id,
+                size=photo_size,
+                source="telegram"
+            )
+
+            label = "13x18 cm" if photo_size == "5x7" else "10x15 cm"
+            await progress_msg.edit_text(
+                f"✅ ¡Foto enviada a la impresora!\n\n"
+                f"🖨️ Canon PIXMA G3110\n"
+                f"📐 Formato: {label} ({photo_size})\n"
+                f"🎨 Calidad: Fotográfica 600ppi\n"
+                f"{enhanced_info}"
+                f"🆔 Job: <code>{job_id}</code>",
+                parse_mode='HTML'
+            )
+        else:
+            error_msg = result.stderr.strip() or "Error desconocido"
+            logger.error(f"Print failed: {error_msg}")
+
+            # Detectar tipo de error para dar mensaje más útil
+            error_lower = error_msg.lower()
+            friendly_error = ""
+
+            if "printer not accepting" in error_lower:
+                friendly_error = "La impresora no está aceptando trabajos. ¿Está encendida y con papel?"
+            elif "filter" in error_lower or "unable to convert" in error_lower:
+                friendly_error = "El formato de la imagen no es compatible. Intenta con otro archivo."
+            elif "timeout" in error_lower or "connection refused" in error_lower:
+                friendly_error = "No se pudo conectar con la impresora. ¿Está encendida y en la red?"
+            else:
+                friendly_error = "Verifica que la impresora esté encendida, con papel y sin atascos."
+
+            # Registrar el fallo en el log de impresiones
+            log_print(
+                user=user.username or str(user.id),
+                file=tmp_path.split('/')[-1] if tmp_path else "foto.jpg",
+                printer=CANON_PRINTER,
+                result="failed",
+                error_msg=error_msg,
+                size=photo_size,
+                source="telegram"
+            )
+
+            await progress_msg.edit_text(
+                f"❌ Error al imprimir:\n<code>{error_msg}</code>\n\n"
+                f"💡 {friendly_error}",
+                parse_mode='HTML'
+            )
+
+            # También enviar alerta directa como mensaje nuevo (más visible)
+            try:
+                await context.bot.send_message(
+                    chat_id=user.id,
+                    text=f"⚠️ La impresión falló:\n<code>{error_msg}</code>\n\n💡 {friendly_error}",
+                    parse_mode='HTML'
+                )
+            except:
+                pass
+
+    except Exception as e:
+        logger.error(f"Error processing photo: {e}")
+        await progress_msg.edit_text(
+            f"❌ Error procesando la foto: {str(e)}\n\n"
+            f"Por favor intenta de nuevo.",
+            parse_mode='HTML'
+        )
+    finally:
+        # Clean up temp files
+        for p in (tmp_path, enhanced_path):
+            if p:
+                try:
+                    os.unlink(p)
+                except:
+                    pass
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handler for normal text messages"""
+    user = update.effective_user
+    text = update.message.text
+
+    # Ignorar mensajes de no autorizados
+    if user.id not in ALLOWED_USER_IDS:
+        logger.warning(f"Text message ignored from unauthorized user: {user.id}")
+        return
+
+    logger.info(f"Text message from {user.first_name} (@{user.username}): {text}")
+
+    # Si hay una fecha pendiente y llega texto, atenderla PRIMERO
+    pending = PENDING_DATE.get(user.id)
+    if pending and not pending[0].done():
+        fut, deadline = pending
+        if text.strip().lower() in ("/sinfecha", "sinfecha", "sin fecha"):
+            fut.set_result(None)
+            await update.message.reply_text("📅 Ok, se estampa sin fecha.")
+            PENDING_DATE.pop(user.id, None)
+            return
+        date = wm.normalize_date(text)
+        if date:
+            fut.set_result(date)
+            await update.message.reply_text(f"📅 Fecha {date} registrada. La estampo en la esquina. 🧡")
+            PENDING_DATE.pop(user.id, None)
+            return
+        else:
+            await update.message.reply_text(
+                "❓ Formato no reconocido. Envíame la fecha como DD-MM-AAAA (ej: 25-10-1998) "
+                "o /sinfecha si no la sabes."
+            )
+            return
+
+    # If user sends "imprimir" or similar without a photo, remind them
+    if text.lower() in ['imprimir', 'print', 'foto', 'photo']:
+        await update.message.reply_text(
+            "📸 Para imprimir, envíame la foto directamente (como imagen, no como archivo).\n\n"
+            "Yo la descargaré, la mejoraré automáticamente y la enviaré a la Canon PIXMA G3110."
+        )
+    elif "hola" in text.lower() or "hello" in text.lower():
+        await update.message.reply_text("¡Hola! 👋 Envíame una foto para imprimir.")
+    elif "gracias" in text.lower() or "thanks" in text.lower():
+        await update.message.reply_text("De nada! 😊 ¿Algo más que imprimir?")
+    else:
+        # Don't auto-respond to all messages to avoid spam
+        pass
+
+
+async def sinfecha(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handler for /sinfecha - el usuario renuncia a la estampa de fecha."""
+    user = update.effective_user
+    pending = PENDING_DATE.get(user.id)
+    if pending and not pending[0].done():
+        pending[0].set_result(None)
+        PENDING_DATE.pop(user.id, None)
+        await update.message.reply_text("📅 Ok, se estampa sin fecha.")
+
+
+def main() -> None:
+    """Start the bot."""
+    # Create log directory if doesn't exist
+    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+
+    # Create application
+    # Timeouts generosos: getFile/sendPhoto con fotos grandes daban Timed out
+    from telegram.request import HTTPXRequest
+    req = HTTPXRequest(connect_timeout=30, read_timeout=120, write_timeout=180, pool_timeout=30)
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .request(req)
+        .get_updates_request(HTTPXRequest(connect_timeout=30, read_timeout=120, pool_timeout=30))
+        .build()
+    )
+
+    # Register command handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("size", set_paper_size))
+    application.add_handler(CommandHandler("enhance", toggle_enhance))
+    application.add_handler(CommandHandler("crop", set_crop_strategy))
+    application.add_handler(CommandHandler("filter", set_filter_profile))
+    application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("queue", queue_command))
+    application.add_handler(CommandHandler("ping", ping))
+    application.add_handler(CommandHandler("pause", pause_queue))
+    application.add_handler(CommandHandler("resume", resume_queue))
+    application.add_handler(CommandHandler("sinfecha", sinfecha))
+
+    # Handler for photos (most important!)
+    application.add_handler(MessageHandler(filters.PHOTO, print_photo))
+
+    # Handler for text messages (but not commands)
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    # Start the bot
+    logger.info("Starting Impression Bot...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == '__main__':
+    main()
