@@ -590,7 +590,31 @@ async def print_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
             try:
                 await progress_msg.edit_text("🎨 Mejorando foto antes de imprimir...")
-                meta = await asyncio.to_thread(photo_pipeline.run, tmp_path, None)
+
+                # Latido: editar progreso cada 45s para que no parezca colgado
+                async def _heartbeat():
+                    import time as _t
+                    t0 = _t.monotonic()
+                    while True:
+                        await asyncio.sleep(45)
+                        e = int(_t.monotonic() - t0)
+                        try:
+                            await progress_msg.edit_text(
+                                f"🎨 Mejorando foto... {e//60}m{e%60:02d}s elapsed "
+                                "(el upscale va por CPU y es lento; sigo trabajando)"
+                            )
+                        except Exception:
+                            return
+
+                beat = asyncio.create_task(_heartbeat())
+                try:
+                    meta = await asyncio.to_thread(photo_pipeline.run, tmp_path, None)
+                finally:
+                    beat.cancel()
+                    try:
+                        await beat
+                    except asyncio.CancelledError:
+                        pass
                 logger.info(f"Pipeline F1: {meta}")
                 final_path = meta["final_path"]
                 if meta.get("inspector"):
@@ -612,9 +636,10 @@ async def print_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                                 # Pipeline tardó más que la ventana: reabrir 5 min
                                 reopened = True
                                 await progress_msg.edit_text(
-                                    "⏱️ El procesamiento tomó más de 5 minutos, se te "
-                                    "cerró la ventana de fecha. ¿Fecha para la estampa? "
-                                    "Tienes OTROS 5 minutos (o /sinfecha)."
+                                    "⏱️ La foto tardó más de 5 min en mejorarse, así que "
+                                    "la ventana de fecha cerró. ¿Fecha para la estampa? "
+                                    "Tienes OTROS 5 minutos (o /sinfecha). "
+                                    "Aun así te mando la foto retocada y la imprimo."
                                 )
                                 date_fut = loop.create_future()
                                 deadline = loop.time() + 300
@@ -735,6 +760,51 @@ async def print_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 f"🆔 Job: <code>{job_id}</code>",
                 parse_mode='HTML'
             )
+
+            # Monitor del job: si la física falla (atasco, sin tinta/papel) avisar al chat
+            async def _monitor_print(jid, chat_id):
+                import re as _re, time as _t
+                num = _re.search(r'Fotos-(\d+)', jid)
+                if not num:
+                    return
+                jnum = num.group(1)
+                t0 = _t.monotonic()
+                seen_done = False
+                while _t.monotonic() - t0 < 600:  # max 10 min
+                    await asyncio.sleep(20)
+                    chk = subprocess.run(
+                        ['/usr/bin/lpstat', '-W', 'completed', '-o'],
+                        capture_output=True, text=True)
+                    if f'Fotos-{jnum}' in chk.stdout:
+                        # Apareció en completadas: si falló, CUPS registra estado de error
+                        seen_done = True
+                        state = subprocess.run(
+                            ['/usr/bin/lpstat', '-p', CANON_PRINTER],
+                            capture_output=True, text=True)
+                        if 'error' in state.stdout.lower() or 'atasc' in state.stdout.lower():
+                            await context.bot.send_message(
+                                chat_id,
+                                f"⚠️ ⚠️ El job {jid} terminó pero la impresora reporta "
+                                "error de hardware. La foto NO salió bien: revisa papel/atasco/tinta."
+                            )
+                        return
+                    state = subprocess.run(
+                        ['/usr/bin/lpstat', '-p', CANON_PRINTER],
+                        capture_output=True, text=True)
+                    if 'error' in state.stdout.lower():
+                        await context.bot.send_message(
+                            chat_id,
+                            f"❌ La impresora entró en error con el job {jid} en cola "
+                            "(probablemente atasco o sin papel). Corrígelo y la foto saldrá cuando se despeje."
+                        )
+                        return
+                if not seen_done:
+                    await context.bot.send_message(
+                        chat_id,
+                        f"⏳ El job {jid} lleva 10 min sin completarse. Revisa la impresora por si quedó atascada."
+                    )
+
+            asyncio.create_task(_monitor_print(job_id, user.id))
         else:
             error_msg = result.stderr.strip() or "Error desconocido"
             logger.error(f"Print failed: {error_msg}")
