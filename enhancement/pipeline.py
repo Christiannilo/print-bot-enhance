@@ -84,9 +84,10 @@ def fit_to_print(src: str, size: str, dest: str, dpi: int = 600, borderless: boo
 
 
 def upscale(src: str, dest: str, outscale: float = 2.0) -> tuple[str, str]:
-    """GPU (ncnn-vulkan, GTX 960 ~78s x2) → fallback CPU (torch, ~427s).
-    tile=128: 2GB VRAM no aguanta 256 (vkAllocateMemory failed -2)."""
-    if os.path.exists(UPSCALE_BIN):
+    """CPU (torch) por defecto. GPU ncnn-vulkan DESACTIVADA por defecto:
+    en GTX 960+driver 580 produce rejilla de tiles desalineada (verificado
+    04-nov, 2 corridas limpias). Activar solo si se corrige el stack Vulkan."""
+    if (os.getenv("PRINT_UPSCALE_GPU", "0") == "1") and os.path.exists(UPSCALE_BIN):
         try:
             log = subprocess.run(
                 [UPSCALE_BIN, "-i", src, "-o", dest,
