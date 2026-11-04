@@ -5,18 +5,20 @@ F1 activa solo upscale (Real-ESRGAN, si resolucion=insuficiente); los
 restantes quedan documentados para F2 con ComfyUI (skill print-bot-enhance).
 """
 import datetime
-import os
 import json
 import logging
+import os
 import subprocess
 from pathlib import Path
+
+from PIL import Image, ImageOps
 
 from photo_inspector import inspect
 import watermark
 
 logger = logging.getLogger("photo_pipeline")
 
-DATASET_DIR = Path(os.getenv("PHOTOS_DATASET_DIR", "/root/photos_dataset"))
+DATASET_DIR = Path("/root/photos_dataset")
 UPSCALE_BIN = "/opt/print-enhance-venv/bin/realesrgan-ncnn-vulkan"
 UPSCALE_MODEL = "/opt/realesrgan-models/realesrgan-x4plus/RealESRGAN_x4plus.pth"
 
@@ -33,6 +35,43 @@ def route(diag: dict, width: int) -> dict:
         "upscale": diag.get("resolucion") == "insuficiente" or width < MIN_PX_LONG,
     }
     return lanes
+
+
+MEDIA_SPECS = {
+    # tamaño_lógico: (ancho_cm, alto_cm, media_cups)
+    "5x7": (13.0, 18.0, "Custom.13x18cm"),
+    "4x6": (10.0, 15.0, "Custom.10x15cm"),
+}
+
+
+def fit_to_print(src: str, size: str, dest: str, dpi: int = 600) -> tuple[str, dict]:
+    """Rasteriza a píxeles EXACTOS del papel (full-bleed center-crop) y embebe DPI.
+    Herencia: fitplot+ppi en lp se pelean y dimensionan mal; con píxeles exactos
+    + dpi en el JPEG, lp imprime 1:1 sin opciones de escalado. Foto horizontal
+    → papel horizontal (mismo tamaño físico)."""
+    spec = MEDIA_SPECS.get(size)
+    if not spec:
+        return src, {"ajuste": "sin spec, original"}
+    w_cm, h_cm, media = spec
+    img = ImageOps.exif_transpose(Image.open(src)).convert("RGB")
+    pw, ph = img.size
+    if pw > ph:  # foto horizontal → papel horizontal
+        w_cm, h_cm = h_cm, w_cm
+        media = f"Custom.{h_cm:g}x{w_cm:g}cm"
+
+    tw = round(w_cm / 2.54 * dpi)
+    th = round(h_cm / 2.54 * dpi)
+    scale = max(tw / pw, th / ph)  # fill: cubrir papel completo
+    nw, nh = round(pw * scale), round(ph * scale)
+    img = img.resize((nw, nh), Image.LANCZOS)
+    left, top = (nw - tw) // 2, (nh - th) // 2
+    img = img.crop((left, top, left + tw, top + th))
+    img.save(dest, quality=94, dpi=(dpi, dpi))
+    return dest, {
+        "media": media,
+        "pixeles": (tw, th),
+        "ajuste": "full-bleed center-crop",
+    }
 
 
 def upscale_cpu(src: str, dest: str, outscale: float = 2.0) -> str:

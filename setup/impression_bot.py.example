@@ -39,7 +39,7 @@ STATUS_FILE = "/tmp/impression_bot_status.txt"
 BOT_CONFIG_PATH = "/root/.bot_data/memory/impression-bot-config.json"
 
 # Seguridad — solo Christian puede imprimir
-ALLOWED_USER_IDS = [123456789]  # Tu Telegram user ID (@userinfobot)
+ALLOWED_USER_IDS = [123456789]
 
 # Configuración de impresión - Canon PIXMA G3110 via LPD al router
 CANON_PRINTER = "Fotos"
@@ -655,21 +655,39 @@ async def print_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             print_path = tmp_path
             enhanced_info = ""
 
+        # 5. Ajuste físico al papel (píxeles exactos + DPI embebido, 1:1)
+        print_path = print_path if os.path.isabs(print_path) else print_path
+        fit_dest = f"{tmp_path}_fit.jpg"
+        try:
+            print_path, fit_meta = photo_pipeline.fit_to_print(print_path, photo_size, fit_dest)
+            enhanced_info += f"\n📄 Papel: {fit_meta.get('ajuste')} ({fit_meta['pixeles'][0]}x{fit_meta['pixeles'][1]}px)"
+            import json as _json
+            sidecar = Path(meta["dataset_final"]).parent / "sidecar.json"
+            sc = _json.loads(sidecar.read_text())
+            sc["papel"] = fit_meta
+            sidecar.write_text(_json.dumps(sc, indent=2, ensure_ascii=False, default=str))
+        except Exception as e:
+            logger.warning(f"fit_to_print falló, printing sin ajuste exacto: {e}")
+
         # Print the photo
         await progress_msg.edit_text("🖨️ Enviando a la impresora Canon...")
 
-        # Execute lp command for Canon PIXMA G3110
+        media_cups = "Custom.13x18cm" if photo_size == "5x7" else "Custom.10x15cm"
+        try:
+            media_cups = fit_meta["media"]
+        except Exception:
+            pass
+
+        # Execute lp command — SIN scaling/ppi: el jpeg ya viene 1:1 exacto
         result = subprocess.run([
             '/usr/bin/lp', '-d', CANON_PRINTER,
-            '-o', f'media={photo_size}',
-            '-o', 'scaling=fitplot',
-            '-o', 'ppi=600',
+            '-o', f'media={media_cups}',
             '-o', 'MediaType=photopaper',
             '-o', 'ColorModel=rgb',
             '-o', 'print-quality=high',
             '-o', 'CNGrayscale=False',
             print_path
-        ], capture_output=True, text=True, timeout=60)
+        ], capture_output=True, text=True, timeout=120)
 
         if result.returncode == 0:
             # Extract job ID from lp output (e.g., "request id is Fotos-123")
