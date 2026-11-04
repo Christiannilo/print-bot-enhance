@@ -18,7 +18,7 @@ logger = logging.getLogger("photo_pipeline")
 
 DATASET_DIR = Path(os.getenv("PHOTOS_DATASET_DIR", "/root/photos_dataset"))
 UPSCALE_BIN = "/opt/print-enhance-venv/bin/realesrgan-ncnn-vulkan"
-UPSCALE_MODEL = os.getenv("REALESRGAN_MODEL", "/opt/realesrgan-models/realesrgan-x4plus/RealESRGAN_x4plus.pth")
+UPSCALE_MODEL = "/opt/realesrgan-models/realesrgan-x4plus/RealESRGAN_x4plus.pth"
 
 # Umbral duro secundario (el diagnóstico 'resolucion' prima sobre este piso)
 MIN_PX_LONG = 1200
@@ -37,7 +37,7 @@ def route(diag: dict, width: int) -> dict:
 
 def upscale_cpu(src: str, dest: str, outscale: float = 2.0) -> str:
     """Real-ESRGAN x4 CPU (venv torch). Lento: solo cuando el router lo pide."""
-    venv_bin = os.getenv("PRINT_ENHANCE_PYTHON", "/opt/print-enhance-venv/bin/python")
+    venv_bin = "/opt/print-enhance-venv/bin/python"
     script = (
         "from realesrgan import RealESRGANer; from basicsr.archs.rrdbnet_arch import RRDBNet;"
         "from PIL import Image; import numpy as np, sys;"
@@ -99,7 +99,8 @@ def run(input_path: str, date: str | None = None, out_dir: str | None = None) ->
     else:
         final = str(_workdir(ts) / "final.jpg")
         if Path(work) != Path(final):
-            work.replace(final)
+            import shutil
+            shutil.move(str(work), final)
 
     # 4. Dataset (original + final + sidecar)
     folder = DATASET_DIR / ts.strftime("%Y-%m") / ts.strftime("%Y%m%d_%H%M%S")

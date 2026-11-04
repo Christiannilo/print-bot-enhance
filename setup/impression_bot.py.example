@@ -39,7 +39,7 @@ STATUS_FILE = "/tmp/impression_bot_status.txt"
 BOT_CONFIG_PATH = "/root/.bot_data/memory/impression-bot-config.json"
 
 # Seguridad — solo Christian puede imprimir
-ALLOWED_USER_IDS = [123456789]  # Tu Telegram user ID (numeric, obtenlo desde @userinfobot)
+ALLOWED_USER_IDS = [123456789]  # Tu Telegram user ID (@userinfobot)
 
 # Configuración de impresión - Canon PIXMA G3110 via LPD al router
 CANON_PRINTER = "Fotos"
@@ -594,17 +594,32 @@ async def print_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 if meta.get("inspector"):
                     enhanced_info += f"🔍 Inspector: {meta.get('inspector')}\n"
 
-                # Esperar la respuesta de la fecha (el reloj corre desde la foto)
+                # Esperar la respuesta de la fecha (reloj corre desde la foto)
                 date = exif_date
                 if date_fut is not None:
                     loop = asyncio.get_running_loop()
+                    date = None
+                    reopened = False
                     wait = max(0.1, deadline - loop.time())
-                    try:
-                        date = await asyncio.wait_for(date_fut, timeout=wait)
-                    except asyncio.TimeoutError:
-                        date = None
-                    finally:
-                        PENDING_DATE.pop(user.id, None)
+                    while True:
+                        try:
+                            date = await asyncio.wait_for(date_fut, timeout=wait)
+                            break
+                        except asyncio.TimeoutError:
+                            if not reopened and (loop.time() > deadline):
+                                # Pipeline tardó más que la ventana: reabrir 5 min
+                                reopened = True
+                                await progress_msg.edit_text(
+                                    "⏱️ El procesamiento tomó más de 5 minutos, se te "
+                                    "cerró la ventana de fecha. ¿Fecha para la estampa? "
+                                    "Tienes OTROS 5 minutos (o /sinfecha)."
+                                )
+                                date_fut = loop.create_future()
+                                PENDING_DATE[user.id] = (date_fut, loop.time() + 300)
+                                wait = 300
+                            else:
+                                break
+                    PENDING_DATE.pop(user.id, None)
 
                 if date:
                     stamped = wm.stamp(final_path, date, f"{tmp_path}_dated.jpg")
@@ -628,7 +643,7 @@ async def print_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     if activos:
                         enhanced_info += f"\n🛠️ Carriles: {', '.join(activos)}"
             except Exception as e:
-                logger.error(f"Pipeline F1 failed, printing original: {e}")
+                logger.exception(f"Pipeline F1 failed, printing original: {e}")
                 await progress_msg.edit_text(
                     f"⚠️ No se pudo mejorar la foto ({str(e)}).\n"
                     "Se imprimirá la original."
