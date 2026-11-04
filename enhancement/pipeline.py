@@ -21,7 +21,7 @@ import watermark
 logger = logging.getLogger("photo_pipeline")
 
 DATASET_DIR = Path(os.getenv("PHOTOS_DATASET_DIR", "/root/photos_dataset"))
-UPSCALE_BIN = "/opt/print-enhance-venv/bin/realesrgan-ncnn-vulkan"
+UPSCALE_BIN = os.getenv("UPSCALE_BIN", "/opt/realesrgan-ncnn-vulkan/realesrgan-ncnn-vulkan")
 UPSCALE_MODEL = os.getenv(
     "REALESRGAN_MODEL",
     "/opt/realesrgan-models/realesrgan-x4plus/RealESRGAN_x4plus.pth",
@@ -83,20 +83,39 @@ def fit_to_print(src: str, size: str, dest: str, dpi: int = 600, borderless: boo
     }
 
 
-def upscale_cpu(src: str, dest: str, outscale: float = 2.0) -> str:
-    """Real-ESRGAN x4 CPU (venv torch). Lento: solo cuando el router lo pide."""
-    venv_bin = PRINT_ENHANCE_PYTHON
-    script = (
-        "from realesrgan import RealESRGANer; from basicsr.archs.rrdbnet_arch import RRDBNet;"
-        "from PIL import Image; import numpy as np, sys;"
-        "rr=RRDBNet(num_in_ch=3,num_out_ch=3,num_feat=64,num_block=23,num_grow_ch=32,scale=4);"
-        "up=RealESRGANer(scale=4,model_path='%s',model=rr,tile=128);"
-        "img=np.array(Image.open(sys.argv[1]).convert('RGB'));"
-        "out=up.enhance(img,outscale=%s)[0];"
-        "Image.fromarray(out.astype('uint8')).save(sys.argv[2])"
-    ) % (UPSCALE_MODEL, outscale)
-    subprocess.run([venv_bin, "-c", script, src, dest], check=True, timeout=3600)
-    return dest
+def upscale(src: str, dest: str, outscale: float = 2.0) -> tuple[str, str]:
+    """GPU (ncnn-vulkan, GTX 960 ~78s x2) → fallback CPU (torch, ~427s).
+    tile=128: 2GB VRAM no aguanta 256 (vkAllocateMemory failed -2)."""
+    if os.path.exists(UPSCALE_BIN):
+        try:
+            log = subprocess.run(
+                [UPSCALE_BIN, "-i", src, "-o", dest,
+                 "-n", "realesrgan-x4plus", "-s", str(outscale), "-t", "128"],
+                capture_output=True, text=True, timeout=1800)
+            if log.returncode == 0 and os.path.exists(dest):
+                return dest, "ncnn-vulkan(GPU)"
+            logger.warning("upscale GPU falló (rc=%s), fallback CPU: %s",
+                           log.returncode, log.stderr[-200:])
+        except Exception as e:
+            logger.warning(f"upscale GPU lanzó excepción, fallback CPU: {e}")
+    subprocess.run([PRINT_ENHANCE_PYTHON, "-c", _cpu_upscale_script(outscale), src, dest],
+                   check=True, timeout=3600)
+    return dest, "torch(CPU)"
+
+
+_CPU_UPL = (
+    "from realesrgan import RealESRGANer; from basicsr.archs.rrdbnet_arch import RRDBNet;"
+    "from PIL import Image; import numpy as np, sys;"
+    "rr=RRDBNet(num_in_ch=3,num_out_ch=3,num_feat=64,num_block=23,num_grow_ch=32,scale=4);"
+    "up=RealESRGANer(scale=4,model_path='{m}',model=rr,tile=128);"
+    "img=np.array(Image.open(sys.argv[1]).convert('RGB'));"
+    "out=up.enhance(img,outscale={s})[0];"
+    "Image.fromarray(out.astype('uint8')).save(sys.argv[2])"
+)
+
+
+def _cpu_upscale_script(outscale: float) -> str:
+    return _CPU_UPL.format(m=UPSCALE_MODEL, s=outscale)
 
 
 def _uid(ts) -> str:
@@ -141,8 +160,9 @@ def run(input_path: str, date: str | None = None, out_dir: str | None = None) ->
     if lanes.get("upscale"):
         up = _workdir(ts) / "work_up.jpg"
         try:
-            work = upscale_cpu(str(work), str(up))
+            work, engine = upscale(str(work), str(up))
             meta["carriles"]["upscale_hecho"] = True
+            meta["upscale_engine"] = engine
         except Exception as e:
             logger.warning(f"upscale falló, siguiendo sin él: {e}")
 
