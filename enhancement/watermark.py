@@ -6,11 +6,10 @@ Fuente: /usr/share/fonts/truetype/dseg/DSEG14Classic-BoldItalic.ttf (OFL).
 import re
 import subprocess
 from pathlib import Path
-import os
 from PIL import Image, ImageDraw, ImageFont
 
-DSEG_FONT = os.getenv("DSEG_FONT", "/usr/share/fonts/truetype/dseg/DSEG14Classic-BoldItalic.ttf")
-FALLBACK_FONT = os.getenv("FALLBACK_FONT", "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf")
+DSEG_FONT = "/usr/share/fonts/truetype/dseg/DSEG14Classic-BoldItalic.ttf"
+FALLBACK_FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf"
 NARANJA = (255, 120, 30)
 PCT = 0.022  # % del ancho de la foto
 

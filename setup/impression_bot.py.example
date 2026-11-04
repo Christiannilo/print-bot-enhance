@@ -29,8 +29,8 @@ sys.path.insert(0, '/root/my_print_bot/enhance_f1')
 import pipeline as photo_pipeline
 import watermark as wm
 
-# Fecha pendiente por usuario: {user_id: (future, deadline)}. 5 min para responder.
-PENDING_DATE: dict = {}
+# Pendientes de fecha: {user_id: [(future, deadline, message_id), ...]} por foto
+PENDING_DATE: dict[int, list] = {}
 
 # Configuración
 BOT_TOKEN = os.getenv("IMPRESSION_BOT_TOKEN", "TU_TOKEN_AQUI")
@@ -582,7 +582,9 @@ async def print_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     loop = asyncio.get_running_loop()
                     date_fut = loop.create_future()
                     deadline = loop.time() + 300
-                    PENDING_DATE[user.id] = (date_fut, deadline)
+                    PENDING_DATE.setdefault(user.id, []).append(
+                        (date_fut, deadline, message.message_id)
+                    )
             except Exception as e:
                 logger.warning(f"verificación de fecha falló: {e}")
 
@@ -615,11 +617,17 @@ async def print_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                                     "Tienes OTROS 5 minutos (o /sinfecha)."
                                 )
                                 date_fut = loop.create_future()
-                                PENDING_DATE[user.id] = (date_fut, loop.time() + 300)
+                                deadline = loop.time() + 300
+                                PENDING_DATE.setdefault(user.id, []).append(
+                                    (date_fut, deadline, message.message_id)
+                                )
                                 wait = 300
                             else:
                                 break
-                    PENDING_DATE.pop(user.id, None)
+                    # resolver y limpiar solo esta entrada (no las de otras fotos)
+                    PENDING_DATE[user.id] = [
+                        p for p in PENDING_DATE.get(user.id, []) if p[0] is not date_fut
+                    ]
 
                 if date:
                     stamped = wm.stamp(final_path, date, f"{tmp_path}_dated.jpg")
@@ -656,18 +664,19 @@ async def print_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             enhanced_info = ""
 
         # 5. Ajuste físico al papel (píxeles exactos + DPI embebido, 1:1)
-        print_path = print_path if os.path.isabs(print_path) else print_path
+        fit_meta = None
         fit_dest = f"{tmp_path}_fit.jpg"
         try:
             print_path, fit_meta = photo_pipeline.fit_to_print(print_path, photo_size, fit_dest)
             enhanced_info += f"\n📄 Papel: {fit_meta.get('ajuste')} ({fit_meta['pixeles'][0]}x{fit_meta['pixeles'][1]}px)"
-            import json as _json
-            sidecar = Path(meta["dataset_final"]).parent / "sidecar.json"
-            sc = _json.loads(sidecar.read_text())
-            sc["papel"] = fit_meta
-            sidecar.write_text(_json.dumps(sc, indent=2, ensure_ascii=False, default=str))
+            if config.enhance_enabled:
+                import json as _json
+                sidecar = Path(meta["dataset_final"]).parent / "sidecar.json"
+                sc = _json.loads(sidecar.read_text())
+                sc["papel"] = fit_meta
+                sidecar.write_text(_json.dumps(sc, indent=2, ensure_ascii=False, default=str))
         except Exception as e:
-            logger.warning(f"fit_to_print falló, printing sin ajuste exacto: {e}")
+            logger.warning(f"fit_to_print sidecar falló (el ajuste del papel sigue 1:1): {e}")
 
         # Print the photo
         await progress_msg.edit_text("🖨️ Enviando a la impresora Canon...")
@@ -788,20 +797,27 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     logger.info(f"Text message from {user.first_name} (@{user.username}): {text}")
 
-    # Si hay una fecha pendiente y llega texto, atenderla PRIMERO
-    pending = PENDING_DATE.get(user.id)
-    if pending and not pending[0].done():
-        fut, deadline = pending
+    # Si hay una fecha pendiente y llega texto, atenderla PRIMERO (la más antigua)
+    pendings = [p for p in PENDING_DATE.get(user.id, []) if not p[0].done()]
+    PENDING_DATE[user.id] = [p for p in PENDING_DATE.get(user.id, []) if p in pendings]
+    if pendings:
+        fut, deadline, _mid = pendings[0]
+        import asyncio as _aio
+        if _aio.get_running_loop().time() > deadline:
+            # Ventana expirada: descartar huérfano (audit dsh LOW/MED)
+            PENDING_DATE[user.id] = [p for p in PENDING_DATE.get(user.id, []) if p[0] is not fut]
+            await update.message.reply_text("⏱️ Esa ventana de fecha ya expiró. Vuelve a enviar la foto si quieres estamparla.")
+            return
         if text.strip().lower() in ("/sinfecha", "sinfecha", "sin fecha"):
             fut.set_result(None)
-            await update.message.reply_text("📅 Ok, se estampa sin fecha.")
-            PENDING_DATE.pop(user.id, None)
+            await update.message.reply_text("📅 Ok, se estampa sin fecha. 🧡")
+            PENDING_DATE[user.id] = [p for p in PENDING_DATE[user.id] if p[0] is not fut]
             return
         date = wm.normalize_date(text)
         if date:
             fut.set_result(date)
             await update.message.reply_text(f"📅 Fecha {date} registrada. La estampo en la esquina. 🧡")
-            PENDING_DATE.pop(user.id, None)
+            PENDING_DATE[user.id] = [p for p in PENDING_DATE[user.id] if p[0] is not fut]
             return
         else:
             await update.message.reply_text(
@@ -828,11 +844,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def sinfecha(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handler for /sinfecha - el usuario renuncia a la estampa de fecha."""
     user = update.effective_user
-    pending = PENDING_DATE.get(user.id)
-    if pending and not pending[0].done():
-        pending[0].set_result(None)
-        PENDING_DATE.pop(user.id, None)
-        await update.message.reply_text("📅 Ok, se estampa sin fecha.")
+    pendings = [p for p in PENDING_DATE.get(user.id, []) if not p[0].done()]
+    if pendings:
+        fut = pendings[0][0]
+        fut.set_result(None)
+        PENDING_DATE[user.id] = [p for p in PENDING_DATE[user.id] if p[0] is not fut]
+        await update.message.reply_text("📅 Ok, se estampa sin fecha. 🧡")
 
 
 def main() -> None:

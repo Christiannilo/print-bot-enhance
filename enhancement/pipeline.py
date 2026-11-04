@@ -9,6 +9,8 @@ import json
 import logging
 import os
 import subprocess
+import time
+from uuid import uuid4
 from pathlib import Path
 
 from PIL import Image, ImageOps
@@ -18,9 +20,13 @@ import watermark
 
 logger = logging.getLogger("photo_pipeline")
 
-DATASET_DIR = Path("/root/photos_dataset")
+DATASET_DIR = Path(os.getenv("PHOTOS_DATASET_DIR", "/root/photos_dataset"))
 UPSCALE_BIN = "/opt/print-enhance-venv/bin/realesrgan-ncnn-vulkan"
-UPSCALE_MODEL = "/opt/realesrgan-models/realesrgan-x4plus/RealESRGAN_x4plus.pth"
+UPSCALE_MODEL = os.getenv(
+    "REALESRGAN_MODEL",
+    "/opt/realesrgan-models/realesrgan-x4plus/RealESRGAN_x4plus.pth",
+)
+PRINT_ENHANCE_PYTHON = os.getenv("PRINT_ENHANCE_PYTHON", "/opt/print-enhance-venv/bin/python")
 
 # Umbral duro secundario (el diagnóstico 'resolucion' prima sobre este piso)
 MIN_PX_LONG = 1200
@@ -76,7 +82,7 @@ def fit_to_print(src: str, size: str, dest: str, dpi: int = 600) -> tuple[str, d
 
 def upscale_cpu(src: str, dest: str, outscale: float = 2.0) -> str:
     """Real-ESRGAN x4 CPU (venv torch). Lento: solo cuando el router lo pide."""
-    venv_bin = "/opt/print-enhance-venv/bin/python"
+    venv_bin = PRINT_ENHANCE_PYTHON
     script = (
         "from realesrgan import RealESRGANer; from basicsr.archs.rrdbnet_arch import RRDBNet;"
         "from PIL import Image; import numpy as np, sys;"
@@ -90,8 +96,13 @@ def upscale_cpu(src: str, dest: str, outscale: float = 2.0) -> str:
     return dest
 
 
+def _uid(ts) -> str:
+    """Identificador único por corrida (colisión del strftime a segundos es HIGH)."""
+    return f"{ts.strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:6]}"
+
+
 def _workdir(ts) -> Path:
-    d = Path("/tmp/print_enhance") / ts.strftime("%Y%m%d_%H%M%S")
+    d = Path("/tmp/print_enhance") / _uid(ts)
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -105,8 +116,11 @@ def run(input_path: str, date: str | None = None, out_dir: str | None = None) ->
     meta = {"ts": ts.isoformat(), "carriles": {}, "fecha": None, "inspector": None}
 
     # 1. Inspector
+    t0 = time.time()
     diag = inspect(input_path)
+    t_ins = time.time() - t0
     meta["inspector"] = diag.pop("_inspector", None)
+    meta["latencia"] = {"inspector_s": round(t_ins, 2)}
 
     width = Image.open(input_path).size[0]
     lanes = route(diag, width)
@@ -142,12 +156,13 @@ def run(input_path: str, date: str | None = None, out_dir: str | None = None) ->
             shutil.move(str(work), final)
 
     # 4. Dataset (original + final + sidecar)
-    folder = DATASET_DIR / ts.strftime("%Y-%m") / ts.strftime("%Y%m%d_%H%M%S")
+    folder = DATASET_DIR / ts.strftime("%Y-%m") / _uid(ts)
     folder.mkdir(parents=True, exist_ok=True)
     ds_orig = folder / "original.jpg"
     ds_final = folder / "final.jpg"
     _copy(Path(input_path), ds_orig)
     _copy(Path(final), ds_final)
+    meta["latencia"]["total_s"] = round(time.time() - t0, 2)
     meta.update({
         "diagnostic": diag,
         "dataset_orig": str(ds_orig),
