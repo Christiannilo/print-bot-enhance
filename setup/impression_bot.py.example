@@ -20,7 +20,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # Importar logger de impresión y mejora de fotos
-sys.path.insert(0, '/path/to/your/media/scripts')
+sys.path.insert(0, '/path/to/your/scripts')
 from rio_print_logger import log_print
 from photo_enhance import EnhanceConfig, enhance_photo_from_config
 
@@ -662,6 +662,17 @@ async def print_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         else:
             print_path = tmp_path
             enhanced_info = ""
+
+        # 4b. Devolver la foto retocada al chat (previa al rasterizado al papel)
+        try:
+            with open(print_path, "rb") as _f:
+                await message.reply_photo(
+                    photo=_f,
+                    caption="🎨 👆 Esta es la foto retocada que va a imprimir. "
+                            "(La impresa va full-bleed al papel, puede recortar bordes).",
+                )
+        except Exception as e:
+            logger.warning(f"no pude devolver la foto al chat: {e}")
 
         # 5. Ajuste físico al papel (píxeles exactos + DPI embebido, 1:1)
         fit_meta = None

@@ -44,29 +44,32 @@ def route(diag: dict, width: int) -> dict:
 
 
 MEDIA_SPECS = {
-    # tamaño_lógico: (ancho_cm, alto_cm, media_cups)
-    "5x7": (13.0, 18.0, "Custom.13x18cm"),
-    "4x6": (10.0, 15.0, "Custom.10x15cm"),
+    # tamaño_lógico: (ancho_in, alto_in, media_borderless, media_borde)
+    # Solo medios NATIVOS del PPD (lpoptions -p Fotos -l): 4x6, 5x7, 8x10, etc.
+    # Custom.13x18cm NO existe en el PPD → CUPS cae a default y escala mal.
+    "5x7": (5.0, 7.0, "5x7.bl", "5x7"),
+    "4x6": (4.0, 6.0, "4x6.bl", "4x6"),
 }
 
 
-def fit_to_print(src: str, size: str, dest: str, dpi: int = 600) -> tuple[str, dict]:
-    """Rasteriza a píxeles EXACTOS del papel (full-bleed center-crop) y embebe DPI.
-    Herencia: fitplot+ppi en lp se pelean y dimensionan mal; con píxeles exactos
-    + dpi en el JPEG, lp imprime 1:1 sin opciones de escalado. Foto horizontal
-    → papel horizontal (mismo tamaño físico)."""
+def fit_to_print(src: str, size: str, dest: str, dpi: int = 600, borderless: bool = True) -> tuple[str, dict]:
+    """Rasteriza a píxeles EXACTOS del papel nativo (full-bleed center-crop si
+    borderless=True, fit con márgenes si no) y embebe DPI.
+    lp imprime 1:1 sin opciones de escalado. Foto horizontal → papel horizontal.
+    El ancho/alto proviene del PPD de la impresora (5in/7in exactos, no 13cm)."""
     spec = MEDIA_SPECS.get(size)
     if not spec:
         return src, {"ajuste": "sin spec, original"}
-    w_cm, h_cm, media = spec
+    w_in, h_in, media_f, media_b = spec
     img = ImageOps.exif_transpose(Image.open(src)).convert("RGB")
     pw, ph = img.size
+    media = (media_f if borderless else media_b)
     if pw > ph:  # foto horizontal → papel horizontal
-        w_cm, h_cm = h_cm, w_cm
-        media = f"Custom.{h_cm:g}x{w_cm:g}cm"
+        w_in, h_in = h_in, w_in
+        media = media.replace(f"{size}.bl", f"{size}.bl") # el mismo nombre de PageSize sirve (CUPS maneja orientación)
 
-    tw = round(w_cm / 2.54 * dpi)
-    th = round(h_cm / 2.54 * dpi)
+    tw = round(w_in * dpi)
+    th = round(h_in * dpi)
     scale = max(tw / pw, th / ph)  # fill: cubrir papel completo
     nw, nh = round(pw * scale), round(ph * scale)
     img = img.resize((nw, nh), Image.LANCZOS)
@@ -76,7 +79,7 @@ def fit_to_print(src: str, size: str, dest: str, dpi: int = 600) -> tuple[str, d
     return dest, {
         "media": media,
         "pixeles": (tw, th),
-        "ajuste": "full-bleed center-crop",
+        "ajuste": "full-bleed borderless" if borderless else "fit con márgenes",
     }
 
 
