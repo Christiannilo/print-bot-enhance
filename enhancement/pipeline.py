@@ -22,6 +22,8 @@ logger = logging.getLogger("photo_pipeline")
 
 DATASET_DIR = Path(os.getenv("PHOTOS_DATASET_DIR", "/root/photos_dataset"))
 UPSCALE_BIN = os.getenv("UPSCALE_BIN", "/opt/realesrgan-ncnn-vulkan/realesrgan-ncnn-vulkan")
+UPSCALE_CUDA_PY = os.getenv("UPSCALE_CUDA_PY", "/opt/cuda-upscale-venv/bin/python")
+UPSCALE_CUDA_SCRIPT = os.getenv("UPSCALE_CUDA_SCRIPT", os.path.join(os.path.dirname(__file__), "cuda_upscale.py"))
 UPSCALE_MODEL = os.getenv(
     "REALESRGAN_MODEL",
     "/opt/realesrgan-models/realesrgan-x4plus/RealESRGAN_x4plus.pth",
@@ -84,21 +86,19 @@ def fit_to_print(src: str, size: str, dest: str, dpi: int = 600, borderless: boo
 
 
 def upscale(src: str, dest: str, outscale: float = 2.0) -> tuple[str, str]:
-    """CPU (torch) por defecto. GPU ncnn-vulkan DESACTIVADA por defecto:
-    en GTX 960+driver 580 produce rejilla de tiles desalineada (verificado
-    04-nov, 2 corridas limpias). Activar solo si se corrige el stack Vulkan."""
-    if (os.getenv("PRINT_UPSCALE_GPU", "0") == "1") and os.path.exists(UPSCALE_BIN):
+    """Cadena: torch-CUDA (32s, verificado limpio) → torch-CPU (427s).
+    ncnn-vulkan DESACTIVADO: GTX 960+driver 580 produce rejilla rota."""
+    if os.path.exists(UPSCALE_CUDA_PY):
         try:
             log = subprocess.run(
-                [UPSCALE_BIN, "-i", src, "-o", dest,
-                 "-n", "realesrgan-x4plus", "-s", str(outscale), "-t", "128"],
+                [UPSCALE_CUDA_PY, UPSCALE_CUDA_SCRIPT, src, dest, str(outscale)],
                 capture_output=True, text=True, timeout=1800)
             if log.returncode == 0 and os.path.exists(dest):
-                return dest, "ncnn-vulkan(GPU)"
-            logger.warning("upscale GPU falló (rc=%s), fallback CPU: %s",
+                return dest, "torch-cuda"
+            logger.warning("upscale CUDA falló (rc=%s), fallback CPU: %s",
                            log.returncode, log.stderr[-200:])
         except Exception as e:
-            logger.warning(f"upscale GPU lanzó excepción, fallback CPU: {e}")
+            logger.warning(f"upscale CUDA lanzó excepción, fallback CPU: {e}")
     subprocess.run([PRINT_ENHANCE_PYTHON, "-c", _cpu_upscale_script(outscale), src, dest],
                    check=True, timeout=3600)
     return dest, "torch(CPU)"
