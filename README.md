@@ -1,3 +1,16 @@
+<p align="center">
+  <img src="assets/banner.svg" alt="print-bot-enhance" width="700"/>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/language-python-bd5622?style=flat-square" alt="Python"/>
+  <img src="https://img.shields.io/badge/maintainer-christian__nilo-8b949e?style=flat-square" alt="maintainer"/>
+  <img src="https://img.shields.io/badge/brand-SCL__San__Enrique-58a6ff?style=flat-square" alt="brand"/>
+<a href="#"><img src="https://img.shields.io/badge/production-scl--01&nbsp;F1-live-3fb950?style=flat-square" alt="production"/></a>
+</p>
+
+*Pipeline de mejora de fotos para un bot de impresión de Telegram — inspector multimodal → router por carriles → estampa de fecha analógica. En producción (F1 live) en scl-01.*
+<!-- design: SCL_San_Enrique v1 — banner+badges -->
 # print-bot-enhance
 
 Pipeline de mejora de fotos para un bot de impresión de Telegram (Epson/Canon G3010/G3110). Lo usa mi print_bot en producción en scl-01.
@@ -114,3 +127,9 @@ Verificado 04-nov-2026 con Ollama en producción:
 ## Licencia
 
 MIT — el módulo es software libre. La fuente DSEG14 es de su propio repo (keshikan/DSEG, Open Font License).
+
+---
+
+<p align="center">
+  <i>Part of the <b>SCL_San_Enrique</b> server suite · Santiago, Chile 🇨🇱</i>
+</p>
