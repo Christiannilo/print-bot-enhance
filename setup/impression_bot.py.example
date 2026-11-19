@@ -143,6 +143,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 /filter - Perfil de ajuste (auto/vivid/soft/none)
 /status - Estado del sistema
 /queue - Ver cola de impresión
+/cancel - Cancelar trabajo pendiente (o /cancel Fotos-504, /cancel all)
 /ping - Test de conectividad
 /pause - Pausar cola de impresión
 /resume - Reanudar trabajos pausados
@@ -460,6 +461,58 @@ async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text(f"❌ Error al consultar la cola: {str(e)}")
 
 
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handler for /cancel - Cancela trabajos de impresión pendientes.
+
+    /cancel            → cancela el job activo si hay exactamente uno; si hay varios, lista y pide id
+    /cancel Fotos-504  → cancela ese job
+    /cancel 504        → igual (usa como cola el prefijo del primer job pendiente)
+    /cancel all        → cancela TODO lo pendiente (cancel -a)
+    """
+    import subprocess as _sp
+
+    args = (context.args or [])
+    arg = args[0].strip() if args else ""
+
+    # Jobs pendientes
+    try:
+        active = _sp.run(['/usr/bin/lpstat', '-W', 'not-completed', '-o'],
+                         capture_output=True, text=True, timeout=10).stdout.strip()
+    except Exception as e:
+        await update.message.reply_text(f"❌ No pude leer la cola: {e}")
+        return
+
+    pending_ids = [l.split()[0] for l in active.splitlines() if l.strip()]
+
+    async def _do_cancel(jid: str) -> str:
+        r = _sp.run(['/usr/bin/cancel', jid], capture_output=True, text=True, timeout=15)
+        if r.returncode == 0:
+            return f"🗑️ <code>{jid}</code> cancelado OK."
+        return f"⚠️ <code>{jid}</code>: cancel no lo soltó ({(r.stderr or 'sin detalle').strip()})."
+
+    reply = ""
+
+    if arg.lower() in ("all", "todos", "todo"):
+        r = _sp.run(['/usr/bin/cancel', '-a'], capture_output=True, text=True, timeout=20)
+        reply = "🧹 Cola completamente vaciada (cancel -a)." if r.returncode == 0 else \
+                f"⚠️ cancel -a falló: {(r.stderr or 'sin detalle').strip()}"
+    elif arg:
+        jid = arg if '-' in arg else f"{'Fotos' if pending_ids and pending_ids[0].startswith('Fotos') else active.split()[0].split('-')[0] if active else 'Fotos'}-{arg}"
+        reply = await _do_cancel(jid)
+    elif pending_ids:
+        if len(pending_ids) == 1:
+            reply = await _do_cancel(pending_ids[0])
+        else:
+            reply = ("⏳ Hay varios pendientes, dime cuál:\n<code>"
+                     + "\n".join(pending_ids)
+                     + "\n</code>Usa <code>/cancel Fotos-504</code> o <code>/cancel all</code>.")
+    else:
+        reply = "✅ No hay trabajos pendientes que cancelar."
+
+    await update.message.reply_text(reply, parse_mode='HTML')
+    logger.info(f"/cancel args={args} pendientes={pending_ids}")
+
+
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handler for /status command"""
     try:
@@ -620,6 +673,18 @@ async def print_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 if meta.get("inspector"):
                     enhanced_info += f"🔍 Inspector: {meta.get('inspector')}\n"
 
+                # Foto retocada al chat YA (antes de esperar la fecha);
+                # la impresa llevará la estampa si termina habiendo fecha.
+                try:
+                    with open(final_path, "rb") as _f:
+                        await message.reply_photo(
+                            photo=_f,
+                            caption="🎨 👆 Foto retocada, lista. "
+                                    "La impresa va full-bleed al papel.",
+                        )
+                except Exception as e:
+                    logger.warning(f"no pude devolver la foto al chat: {e}")
+
                 # Esperar la respuesta de la fecha (reloj corre desde la foto)
                 date = exif_date
                 if date_fut is not None:
@@ -627,6 +692,14 @@ async def print_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     date = None
                     reopened = False
                     wait = max(0.1, deadline - loop.time())
+                    import datetime as _dt
+                    hasta = _dt.datetime.now() + _dt.timedelta(seconds=wait)
+                    await progress_msg.edit_text(
+                        f"✅ Mejora lista ({meta.get('latencia', {}).get('total_s', '?')}s, "
+                        f"{meta.get('upscale_engine', 'upscale')}). "
+                        f"👆 Foto arriba. Esperando fecha hasta las "
+                        f"{hasta:%H:%M} — o /sinfecha."
+                    )
                     while True:
                         try:
                             date = await asyncio.wait_for(date_fut, timeout=wait)
@@ -682,22 +755,17 @@ async def print_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     "Se imprimirá la original."
                 )
                 print_path = tmp_path
+                # Devolver la original igual al chat (falla != silencio)
+                try:
+                    with open(print_path, "rb") as _f:
+                        await message.reply_photo(photo=_f, caption="⚠️ No se pudo mejorar; imprimo la original tal cual.")
+                except Exception:
+                    pass
                 # Breve espera para que el usuario lea el mensaje
                 await asyncio.sleep(1.5)
         else:
             print_path = tmp_path
             enhanced_info = ""
-
-        # 4b. Devolver la foto retocada al chat (previa al rasterizado al papel)
-        try:
-            with open(print_path, "rb") as _f:
-                await message.reply_photo(
-                    photo=_f,
-                    caption="🎨 👆 Esta es la foto retocada que va a imprimir. "
-                            "(La impresa va full-bleed al papel, puede recortar bordes).",
-                )
-        except Exception as e:
-            logger.warning(f"no pude devolver la foto al chat: {e}")
 
         # 5. Ajuste físico al papel (píxeles exactos + DPI embebido, 1:1)
         fit_meta = None
@@ -751,13 +819,22 @@ async def print_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
 
             label = "13x18 cm" if photo_size == "5x7" else "10x15 cm"
-            await progress_msg.edit_text(
-                f"✅ ¡Foto enviada a la impresora!\n\n"
-                f"🖨️ Canon PIXMA G3110\n"
-                f"📐 Formato: {label} ({photo_size})\n"
-                f"🎨 Calidad: Fotográfica 600ppi\n"
-                f"{enhanced_info}"
-                f"🆔 Job: <code>{job_id}</code>",
+            try:
+                await progress_msg.edit_text("✅ Mejora lista; job enviado a la impresora (ver detalle abajo).")
+            except Exception:
+                pass
+            # Confirmación final como MENSAJE NUEVO: así queda debajo del prompt
+            # de fecha y el orden del chat refleja el orden real del pipeline.
+            await context.bot.send_message(
+                chat_id=user.id,
+                text=(
+                    f"✅ ¡Foto enviada a la impresora!\n\n"
+                    f"🖨️ Canon PIXMA G3110\n"
+                    f"📐 Formato: {label} ({photo_size})\n"
+                    f"🎨 Calidad: Fotográfica 600ppi\n"
+                    f"{enhanced_info}"
+                    f"🆔 Job: <code>{job_id}</code>"
+                ),
                 parse_mode='HTML'
             )
 
@@ -959,6 +1036,7 @@ def main() -> None:
     application.add_handler(CommandHandler("filter", set_filter_profile))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("queue", queue_command))
+    application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("ping", ping))
     application.add_handler(CommandHandler("pause", pause_queue))
     application.add_handler(CommandHandler("resume", resume_queue))
